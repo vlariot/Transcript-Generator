@@ -98,7 +98,7 @@ Coach Name & Client Name - 2025-09-23
 
 ### Tech Stack
 - **Backend:** Node.js + Express
-- **AI:** Anthropic Claude API (claude-3-5-sonnet-20241022)
+- **AI:** Anthropic Claude API (claude-sonnet-4-5-20250929)
 - **File Handling:** Archiver (ZIP creation)
 - **Frontend:** Vanilla JavaScript with Server-Sent Events for real-time updates
 
