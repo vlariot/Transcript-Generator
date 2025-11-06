@@ -61,11 +61,69 @@ dialogue</textarea>
 
         <div id="progressContainer" class="hidden">
             <h2>Generation Progress</h2>
+
+            <!-- Progress Header with Time Estimates -->
+            <div id="progressHeader" class="progress-header">
+                <div class="progress-title">
+                    <span id="progressCount">0 / 0</span>
+                    <span id="progressPercent">(0%)</span>
+                </div>
+                <div class="time-estimates">
+                    <div class="time-item">
+                        <span class="time-label">Elapsed:</span>
+                        <span id="elapsedTime">00:00:00</span>
+                    </div>
+                    <div class="time-item">
+                        <span class="time-label">Remaining:</span>
+                        <span id="remainingTime">--:--:--</span>
+                    </div>
+                    <div class="time-item">
+                        <span class="time-label">ETA:</span>
+                        <span id="eta">--:--</span>
+                    </div>
+                </div>
+                <div class="speed-info">
+                    <span class="speed-label">Speed:</span>
+                    <span id="speed">-- transcripts/min</span>
+                </div>
+            </div>
+
+            <!-- Progress Bar -->
             <div class="progress-bar">
                 <div id="progressBar" class="progress-fill"></div>
             </div>
             <p id="progressText">Preparing...</p>
-            <div id="statusLog"></div>
+
+            <!-- Detailed Status -->
+            <div id="detailedStatus" class="detailed-status">
+                <div class="status-row">
+                    <span class="status-badge completed">✓</span>
+                    <span class="status-label">Completed:</span>
+                    <span id="completedCount" class="status-value">0</span>
+                </div>
+                <div class="status-row">
+                    <span class="status-badge inprogress">⟳</span>
+                    <span class="status-label">In Progress:</span>
+                    <span id="inProgressCount" class="status-value">0</span>
+                </div>
+                <div class="status-row">
+                    <span class="status-badge pending">○</span>
+                    <span class="status-label">Pending:</span>
+                    <span id="pendingCount" class="status-value">0</span>
+                </div>
+                <div class="status-row">
+                    <span class="status-badge failed">✗</span>
+                    <span class="status-label">Failed:</span>
+                    <span id="failedCount" class="status-value">0</span>
+                </div>
+            </div>
+
+            <!-- Current Transcript Info -->
+            <div id="currentTranscript" class="current-transcript hidden">
+                <p id="currentTranscriptInfo">Generating transcript...</p>
+            </div>
+
+            <div id="statusLog" class="status-log"></div>
         </div>
 
         <div id="resultContainer" class="hidden">
