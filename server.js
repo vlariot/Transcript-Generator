@@ -3,6 +3,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const archiver = require('archiver');
 const fs = require('fs');
 const path = require('path');
+const jobManager = require('./jobManager');
 
 const app = express();
 const PORT = 3000;
@@ -36,9 +37,9 @@ function generateRandomDate() {
 
 // Main endpoint to generate transcripts
 app.post('/generate', async (req, res) => {
-    const { apiKey, transcriptCount, prompt } = req.body;
+    const { apiKey, transcriptCount, prompt, jobId } = req.body;
 
-    if (!apiKey || !transcriptCount || !prompt) {
+    if (!apiKey || !transcriptCount || !prompt || !jobId) {
         return res.status(400).json({ error: 'Missing required fields' });
     }
 
@@ -48,17 +49,47 @@ app.post('/generate', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
 
     const anthropic = new Anthropic({ apiKey });
-    const sessionId = Date.now();
-    const sessionDir = path.join(TEMP_DIR, `session_${sessionId}`);
+    const sessionDir = path.join(TEMP_DIR, `session_${jobId}`);
 
     try {
+        // Create job in manager
+        const combos = Array(transcriptCount).fill(null).map((_, i) => ({ index: i }));
+        jobManager.createJob(jobId, transcriptCount, combos);
+
         // Create session directory
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
         }
 
+        res.write(`data: ${JSON.stringify({
+            type: 'status',
+            message: 'Starting transcript generation...'
+        })}\n\n`);
+
         // Generate transcripts one by one
         for (let i = 1; i <= transcriptCount; i++) {
+            // Check if job was cancelled
+            const job = jobManager.getJob(jobId);
+            if (!job || job.state === 'cancelled') {
+                res.write(`data: ${JSON.stringify({
+                    type: 'status',
+                    message: 'Generation cancelled'
+                })}\n\n`);
+                res.end();
+                jobManager.cancelJob(jobId);
+                return;
+            }
+
+            // Wait if paused
+            while (job.state === 'paused') {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                const updatedJob = jobManager.getJob(jobId);
+                if (!updatedJob || updatedJob.state === 'cancelled') {
+                    res.end();
+                    return;
+                }
+            }
+
             try {
                 // Create a specific request for each transcript
                 const specificPrompt = `${prompt}
@@ -100,6 +131,9 @@ Please generate transcript ${i} of ${transcriptCount}. Generate ONE complete tra
                 // Write transcript to file
                 fs.writeFileSync(filepath, transcriptContent, 'utf8');
 
+                // Update job progress
+                jobManager.updateProgress(jobId, i, filename);
+
                 // Send progress update
                 res.write(`data: ${JSON.stringify({
                     type: 'progress',
@@ -119,15 +153,20 @@ Please generate transcript ${i} of ${transcriptCount}. Generate ONE complete tra
                     type: 'error',
                     message: `Failed to generate transcript ${i}: ${error.message}`
                 })}\n\n`);
-                throw error;
+                jobManager.cancelJob(jobId);
+                res.end();
+                return;
             }
         }
 
         // Create ZIP file
-        const zipFilename = `transcripts_${sessionId}.zip`;
+        const zipFilename = `transcripts_${jobId}.zip`;
         const zipPath = path.join(TEMP_DIR, zipFilename);
 
         await createZipFile(sessionDir, zipPath);
+
+        // Mark job as completed
+        jobManager.completeJob(jobId);
 
         // Send completion message
         res.write(`data: ${JSON.stringify({
@@ -156,6 +195,137 @@ Please generate transcript ${i} of ${transcriptCount}. Generate ONE complete tra
         if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true });
         }
+        jobManager.cancelJob(jobId);
+    }
+});
+
+// Pause job endpoint
+app.post('/pause/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const job = jobManager.pauseJob(jobId);
+        const stats = jobManager.getJobStats(jobId);
+
+        res.json({
+            success: true,
+            message: 'Job paused',
+            stats: stats
+        });
+    } catch (error) {
+        console.error(`Error pausing job ${jobId}:`, error);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Resume job endpoint
+app.post('/resume/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const job = jobManager.resumeJob(jobId);
+        const stats = jobManager.getJobStats(jobId);
+
+        res.json({
+            success: true,
+            message: 'Job resumed',
+            stats: stats
+        });
+    } catch (error) {
+        console.error(`Error resuming job ${jobId}:`, error);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Cancel job endpoint
+app.post('/cancel/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const job = jobManager.cancelJob(jobId);
+        const stats = jobManager.getJobStats(jobId);
+
+        res.json({
+            success: true,
+            message: 'Job cancelled',
+            stats: stats
+        });
+    } catch (error) {
+        console.error(`Error cancelling job ${jobId}:`, error);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Get job status endpoint
+app.get('/job-status/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const stats = jobManager.getJobStats(jobId);
+        if (!stats) {
+            return res.status(404).json({
+                success: false,
+                error: 'Job not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            stats: stats
+        });
+    } catch (error) {
+        console.error(`Error getting job status ${jobId}:`, error);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Partial download endpoint (for cancelled/paused jobs)
+app.get('/download-partial/:jobId', async (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const job = jobManager.getJob(jobId);
+        if (!job) {
+            return res.status(404).json({ error: 'Job not found' });
+        }
+
+        const sessionDir = path.join(TEMP_DIR, `session_${jobId}`);
+        if (!fs.existsSync(sessionDir)) {
+            return res.status(404).json({ error: 'Session directory not found' });
+        }
+
+        // Create partial ZIP with completed transcripts
+        const zipFilename = `transcripts_${jobId}_partial.zip`;
+        const zipPath = path.join(TEMP_DIR, zipFilename);
+
+        await createZipFile(sessionDir, zipPath);
+
+        res.download(zipPath, zipFilename, (err) => {
+            if (err) {
+                console.error('Download error:', err);
+            }
+            // Delete file after download
+            setTimeout(() => {
+                if (fs.existsSync(zipPath)) {
+                    fs.unlinkSync(zipPath);
+                }
+            }, 5000);
+        });
+    } catch (error) {
+        console.error(`Error downloading partial results for ${jobId}:`, error);
+        res.status(500).json({ error: error.message });
     }
 });
 
