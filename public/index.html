@@ -86,13 +86,32 @@
                 <div id="progressBar" class="progress-fill"></div>
             </div>
             <p id="progressText">Preparing...</p>
+            <div id="jobStats" class="job-stats hidden">
+                <span id="completedCount">0</span> / <span id="totalCount">0</span> transcripts
+            </div>
             <div id="statusLog"></div>
+
+            <div id="controlButtons" class="control-buttons">
+                <button id="pauseBtn" class="control-btn pause-btn">Pause</button>
+                <button id="resumeBtn" class="control-btn resume-btn hidden">Resume</button>
+                <button id="cancelBtn" class="control-btn cancel-btn">Cancel</button>
+            </div>
         </div>
 
         <div id="resultContainer" class="hidden">
             <h2>✓ Generation Complete!</h2>
             <p>Your transcripts have been generated successfully.</p>
             <button id="downloadBtn" class="download-btn">Download ZIP File</button>
+        </div>
+
+        <div id="cancelledContainer" class="hidden">
+            <h2>⏸ Generation Cancelled</h2>
+            <p id="cancelledMessage">Generation was cancelled.</p>
+            <div id="cancelledStats"></div>
+            <div>
+                <button id="downloadPartialBtn" class="download-btn">Download Partial Results</button>
+                <button id="startNewBtn" class="control-btn">Start New Generation</button>
+            </div>
         </div>
 
         <div id="errorContainer" class="hidden error">
