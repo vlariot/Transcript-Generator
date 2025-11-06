@@ -57,14 +57,23 @@ form.addEventListener('submit', async (e) => {
                 if (line.startsWith('data: ')) {
                     const data = JSON.parse(line.slice(6));
 
-                    if (data.type === 'progress') {
+                    if (data.type === 'status') {
+                        progressText.textContent = data.message;
+
+                        const statusItem = document.createElement('div');
+                        statusItem.className = 'status-item';
+                        statusItem.textContent = `ℹ ${data.message}`;
+                        statusLog.appendChild(statusItem);
+                        statusLog.scrollTop = statusLog.scrollHeight;
+                    } else if (data.type === 'progress') {
                         const percentage = (data.current / data.total) * 100;
                         progressBar.style.width = percentage + '%';
                         progressText.textContent = `Generated ${data.current} of ${data.total} transcripts...`;
 
                         const statusItem = document.createElement('div');
                         statusItem.className = 'status-item';
-                        statusItem.textContent = `✓ Generated: ${data.filename}`;
+                        const context = data.context ? ` (${data.context})` : '';
+                        statusItem.textContent = `✓ Generated: ${data.filename}${context}`;
                         statusLog.appendChild(statusItem);
                         statusLog.scrollTop = statusLog.scrollHeight;
                     } else if (data.type === 'complete') {
