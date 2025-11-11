@@ -3,6 +3,8 @@ const Anthropic = require('@anthropic-ai/sdk');
 const archiver = require('archiver');
 const fs = require('fs');
 const path = require('path');
+const { generateCombos } = require('./comboGenerator');
+const jobManager = require('./jobManager');
 
 const app = express();
 const PORT = 3000;
@@ -36,9 +38,9 @@ function generateRandomDate() {
 
 // Main endpoint to generate transcripts
 app.post('/generate', async (req, res) => {
-    const { apiKey, transcriptCount, prompt } = req.body;
+    const { apiKey, transcriptCount, prompt, jobId } = req.body;
 
-    if (!apiKey || !transcriptCount || !prompt) {
+    if (!apiKey || !transcriptCount || !prompt || !jobId) {
         return res.status(400).json({ error: 'Missing required fields' });
     }
 
@@ -48,86 +50,253 @@ app.post('/generate', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
 
     const anthropic = new Anthropic({ apiKey });
-    const sessionId = Date.now();
-    const sessionDir = path.join(TEMP_DIR, `session_${sessionId}`);
+    const sessionDir = path.join(TEMP_DIR, `session_${jobId}`);
 
     try {
+        // Step 1: Generate coach/client combos using Claude Haiku
+        res.write(`data: ${JSON.stringify({
+            type: 'status',
+            message: 'Generating coach/client combinations...'
+        })}\n\n`);
+
+        let combos;
+        try {
+            combos = await generateCombos(transcriptCount, apiKey);
+        } catch (error) {
+            throw new Error(`Failed to generate combos: ${error.message}`);
+        }
+
+        if (combos.length !== transcriptCount) {
+            throw new Error(`Generated ${combos.length} combos but expected ${transcriptCount}`);
+        }
+
+        // Update job in manager with actual combos
+        jobManager.createJob(jobId, transcriptCount, combos);
+
+        res.write(`data: ${JSON.stringify({
+            type: 'status',
+            message: `Generated ${combos.length} coach/client combinations. Starting transcript generation...`
+        })}\n\n`);
+
         // Create session directory
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
         }
 
-        // Generate transcripts one by one
-        for (let i = 1; i <= transcriptCount; i++) {
+        // Step 2: Group transcripts by series for batch processing
+        const seriesMap = new Map();
+        const singleTranscripts = [];
+
+        for (let i = 0; i < combos.length; i++) {
+            const combo = combos[i];
+            if (combo.isSeriesEpisode) {
+                const seriesId = combo.seriesId;
+                if (!seriesMap.has(seriesId)) {
+                    seriesMap.set(seriesId, []);
+                }
+                seriesMap.get(seriesId).push({ comboIndex: i, ...combo });
+            } else {
+                singleTranscripts.push({ comboIndex: i, ...combo });
+            }
+        }
+
+        res.write(`data: ${JSON.stringify({
+            type: 'status',
+            message: `Grouped ${seriesMap.size} series (${seriesMap.size * 4} episodes) and ${singleTranscripts.length} single transcripts`
+        })}\n\n`);
+
+        let currentProgress = 0;
+        const totalItems = transcriptCount;
+
+        // Step 3: Generate series transcripts together (to maintain context and conversation flow)
+        for (const [seriesId, seriesEpisodes] of seriesMap) {
+            // Check if job was cancelled or paused
+            let job = jobManager.getJob(jobId);
+            if (!job || job.state === 'cancelled') {
+                res.write(`data: ${JSON.stringify({
+                    type: 'status',
+                    message: 'Generation cancelled'
+                })}\n\n`);
+                res.end();
+                return;
+            }
+
+            // Wait if paused
+            while (job.state === 'paused') {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                job = jobManager.getJob(jobId);
+                if (!job || job.state === 'cancelled') {
+                    res.end();
+                    return;
+                }
+            }
+
             try {
-                // Create a specific request for each transcript
-                const specificPrompt = `${prompt}
+                const coach = seriesEpisodes[0].coach;
+                const client = seriesEpisodes[0].client;
+                const location = seriesEpisodes[0].location;
+                const niche = seriesEpisodes[0].niche;
 
-Please generate transcript ${i} of ${transcriptCount}. Generate ONE complete transcript following all the specifications above. Make sure each transcript is unique with different coach/client combinations, locations, and topics. Include realistic names, emails, and full 25-30 minute conversations with timestamps.`;
+                // Generate all 4 episodes for this series in one call
+                const seriesPrompt = `${prompt}
 
-                // Call Claude API
+IMPORTANT: This is a 4-episode series between the same coach and client. Generate all 4 episodes showing progression and continuity.
+
+Coach: ${coach}
+Client: ${client}
+Location: ${location}
+Coaching Niche/Focus: ${niche}
+
+Episode 1: First session - introductory call covering general business situation
+Episode 2: Follow-up (1 week later) - client reports on action items, they discuss progress
+Episode 3: Follow-up (1 week later) - deeper into a specific business challenge introduced in previous calls
+Episode 4: Follow-up (1 week later) - resolution/implementation of strategies discussed, new goals set
+
+Generate all 4 episodes. Each episode should be 25-30 minutes of conversation with timestamps. Make sure:
+- The conversation shows progression and relationship building
+- Previous topics are referenced and built upon
+- The client shows growth/progress over the 4 weeks
+- Different dates for each episode (weekly intervals)
+- Format each episode separately with clear episode markers`;
+
                 const message = await anthropic.messages.create({
                     model: 'claude-sonnet-4-5-20250929',
-                    max_tokens: 16000,
+                    max_tokens: 32000,
                     messages: [{
                         role: 'user',
-                        content: specificPrompt
+                        content: seriesPrompt
                     }]
                 });
 
-                const transcriptContent = message.content[0].text;
+                const seriesContent = message.content[0].text;
 
-                // Extract names from the transcript for filename
-                // Try to find coach and client names
-                let coachName = 'coach';
-                let clientName = 'client';
+                // Split the response into individual episodes and save them
+                // Episodes are marked in the content
+                const episodes = splitSeriesContent(seriesContent, seriesEpisodes);
 
-                const coachMatch = transcriptContent.match(/\*\*Coach:\*\*\s*([^\n]+)/i);
-                const clientMatch = transcriptContent.match(/\*\*Client:\*\*\s*([^\n]+)/i);
+                for (let episodeIdx = 0; episodeIdx < episodes.length; episodeIdx++) {
+                    const episodeContent = episodes[episodeIdx];
+                    const episode = seriesEpisodes[episodeIdx];
+                    const date = generateRandomDate();
 
-                if (coachMatch) {
-                    coachName = sanitizeFilename(coachMatch[1].trim());
-                }
-                if (clientMatch) {
-                    clientName = sanitizeFilename(clientMatch[1].trim());
-                }
+                    const filename = `${sanitizeFilename(coach)}_${sanitizeFilename(client)}_${date}_ep${episode.episodeNumber}_of_${episode.totalEpisodes}.md`;
+                    const filepath = path.join(sessionDir, filename);
 
-                // Generate filename
-                const date = generateRandomDate();
-                const filename = `${coachName}_${clientName}_${date}_${i}.md`;
-                const filepath = path.join(sessionDir, filename);
+                    fs.writeFileSync(filepath, episodeContent, 'utf8');
 
-                // Write transcript to file
-                fs.writeFileSync(filepath, transcriptContent, 'utf8');
+                    // Update job progress
+                    jobManager.updateProgress(jobId, currentProgress, filename);
 
-                // Send progress update
-                res.write(`data: ${JSON.stringify({
-                    type: 'progress',
-                    current: i,
-                    total: transcriptCount,
-                    filename: filename
-                })}\n\n`);
+                    currentProgress++;
+                    res.write(`data: ${JSON.stringify({
+                        type: 'progress',
+                        current: currentProgress,
+                        total: totalItems,
+                        filename: filename,
+                        context: `Series "${coach} & ${client}" - Episode ${episode.episodeNumber}/4`
+                    })}\n\n`);
 
-                // Small delay to avoid rate limiting
-                if (i < transcriptCount) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    // Delay between writing files
+                    if (currentProgress < totalItems) {
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    }
                 }
 
             } catch (error) {
-                console.error(`Error generating transcript ${i}:`, error);
+                console.error(`Error generating series ${seriesId}:`, error);
                 res.write(`data: ${JSON.stringify({
                     type: 'error',
-                    message: `Failed to generate transcript ${i}: ${error.message}`
+                    message: `Failed to generate series ${seriesId}: ${error.message}`
                 })}\n\n`);
                 throw error;
             }
         }
 
+        // Step 4: Generate single transcripts
+        for (const singleCombo of singleTranscripts) {
+            // Check if job was cancelled or paused
+            let job = jobManager.getJob(jobId);
+            if (!job || job.state === 'cancelled') {
+                res.write(`data: ${JSON.stringify({
+                    type: 'status',
+                    message: 'Generation cancelled'
+                })}\n\n`);
+                res.end();
+                return;
+            }
+
+            // Wait if paused
+            while (job.state === 'paused') {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                job = jobManager.getJob(jobId);
+                if (!job || job.state === 'cancelled') {
+                    res.end();
+                    return;
+                }
+            }
+
+            try {
+                const singlePrompt = `${prompt}
+
+Coach: ${singleCombo.coach}
+Client: ${singleCombo.client}
+Location: ${singleCombo.location}
+Coaching Niche/Focus: ${singleCombo.niche}
+
+Generate ONE standalone transcript for this single coaching session (not part of a series). This should be a complete 25-30 minute conversation with realistic dialogue, timestamps, and details.`;
+
+                const message = await anthropic.messages.create({
+                    model: 'claude-sonnet-4-5-20250929',
+                    max_tokens: 16000,
+                    messages: [{
+                        role: 'user',
+                        content: singlePrompt
+                    }]
+                });
+
+                const transcriptContent = message.content[0].text;
+                const date = generateRandomDate();
+                const filename = `${sanitizeFilename(singleCombo.coach)}_${sanitizeFilename(singleCombo.client)}_${date}_single.md`;
+                const filepath = path.join(sessionDir, filename);
+
+                fs.writeFileSync(filepath, transcriptContent, 'utf8');
+
+                // Update job progress
+                jobManager.updateProgress(jobId, currentProgress, filename);
+
+                currentProgress++;
+                res.write(`data: ${JSON.stringify({
+                    type: 'progress',
+                    current: currentProgress,
+                    total: totalItems,
+                    filename: filename
+                })}\n\n`);
+
+                // Small delay to avoid rate limiting
+                if (currentProgress < totalItems) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+
+            } catch (error) {
+                console.error(`Error generating single transcript:`, error);
+                res.write(`data: ${JSON.stringify({
+                    type: 'error',
+                    message: `Failed to generate transcript: ${error.message}`
+                })}\n\n`);
+                jobManager.cancelJob(jobId);
+                res.end();
+                return;
+            }
+        }
+
         // Create ZIP file
-        const zipFilename = `transcripts_${sessionId}.zip`;
+        const zipFilename = `transcripts_${jobId}.zip`;
         const zipPath = path.join(TEMP_DIR, zipFilename);
 
         await createZipFile(sessionDir, zipPath);
+
+        // Mark job as completed
+        jobManager.completeJob(jobId);
 
         // Send completion message
         res.write(`data: ${JSON.stringify({
@@ -156,8 +325,179 @@ Please generate transcript ${i} of ${transcriptCount}. Generate ONE complete tra
         if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true });
         }
+        jobManager.cancelJob(jobId);
     }
 });
+
+// Pause job endpoint
+app.post('/pause/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const job = jobManager.pauseJob(jobId);
+        const stats = jobManager.getJobStats(jobId);
+
+        res.json({
+            success: true,
+            message: 'Job paused',
+            stats: stats
+        });
+    } catch (error) {
+        console.error(`Error pausing job ${jobId}:`, error);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Resume job endpoint
+app.post('/resume/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const job = jobManager.resumeJob(jobId);
+        const stats = jobManager.getJobStats(jobId);
+
+        res.json({
+            success: true,
+            message: 'Job resumed',
+            stats: stats
+        });
+    } catch (error) {
+        console.error(`Error resuming job ${jobId}:`, error);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Cancel job endpoint
+app.post('/cancel/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const job = jobManager.cancelJob(jobId);
+        const stats = jobManager.getJobStats(jobId);
+
+        res.json({
+            success: true,
+            message: 'Job cancelled',
+            stats: stats
+        });
+    } catch (error) {
+        console.error(`Error cancelling job ${jobId}:`, error);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Get job status endpoint
+app.get('/job-status/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const stats = jobManager.getJobStats(jobId);
+        if (!stats) {
+            return res.status(404).json({
+                success: false,
+                error: 'Job not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            stats: stats
+        });
+    } catch (error) {
+        console.error(`Error getting job status ${jobId}:`, error);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Partial download endpoint (for cancelled/paused jobs)
+app.get('/download-partial/:jobId', async (req, res) => {
+    const { jobId } = req.params;
+
+    try {
+        const job = jobManager.getJob(jobId);
+        if (!job) {
+            return res.status(404).json({ error: 'Job not found' });
+        }
+
+        const sessionDir = path.join(TEMP_DIR, `session_${jobId}`);
+        if (!fs.existsSync(sessionDir)) {
+            return res.status(404).json({ error: 'Session directory not found' });
+        }
+
+        // Create partial ZIP with completed transcripts
+        const zipFilename = `transcripts_${jobId}_partial.zip`;
+        const zipPath = path.join(TEMP_DIR, zipFilename);
+
+        await createZipFile(sessionDir, zipPath);
+
+        res.download(zipPath, zipFilename, (err) => {
+            if (err) {
+                console.error('Download error:', err);
+            }
+            // Delete file after download
+            setTimeout(() => {
+                if (fs.existsSync(zipPath)) {
+                    fs.unlinkSync(zipPath);
+                }
+            }, 5000);
+        });
+    } catch (error) {
+        console.error(`Error downloading partial results for ${jobId}:`, error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Helper function to split series content into episodes
+function splitSeriesContent(content, episodes) {
+    // Try to split by episode markers
+    const episodeTexts = [];
+    const lines = content.split('\n');
+    let currentEpisode = [];
+    let episodeCount = 0;
+
+    for (const line of lines) {
+        if ((line.toLowerCase().includes('episode') && line.includes(':')) || line.match(/^#+\s+.*Episode\s+\d/i)) {
+            if (currentEpisode.length > 0 && episodeCount > 0) {
+                episodeTexts.push(currentEpisode.join('\n'));
+                currentEpisode = [];
+            }
+            episodeCount++;
+        }
+        currentEpisode.push(line);
+    }
+
+    // Don't forget the last episode
+    if (currentEpisode.length > 0) {
+        episodeTexts.push(currentEpisode.join('\n'));
+    }
+
+    // If we couldn't parse episodes properly, split approximately
+    if (episodeTexts.length < episodes.length) {
+        const linesPerEpisode = Math.floor(lines.length / episodes.length);
+        episodeTexts.length = 0;
+
+        for (let i = 0; i < episodes.length; i++) {
+            const start = i * linesPerEpisode;
+            const end = i === episodes.length - 1 ? lines.length : (i + 1) * linesPerEpisode;
+            episodeTexts.push(lines.slice(start, end).join('\n'));
+        }
+    }
+
+    // Ensure we have the right number of episodes
+    return episodeTexts.slice(0, episodes.length);
+}
 
 // Helper function to create ZIP file
 function createZipFile(sourceDir, outputPath) {
