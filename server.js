@@ -329,6 +329,7 @@ Generate ONE standalone transcript for this single coaching session (not part of
                             content: singlePrompt
                         }]
                     });
+                });
 
                 const transcriptContent = message.content[0].text;
                 const date = generateRandomDate();
