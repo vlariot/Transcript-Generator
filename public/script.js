@@ -21,14 +21,263 @@ const pauseBtn = document.getElementById('pauseBtn');
 const resumeBtn = document.getElementById('resumeBtn');
 const cancelBtn = document.getElementById('cancelBtn');
 
+const modelSelect = document.getElementById('modelSelect');
+const modelInfo = document.getElementById('modelInfo');
+const costEstimate = document.getElementById('costEstimate');
+const estimateDetails = document.getElementById('estimateDetails');
+const costEstimateToggle = document.getElementById('costEstimateToggle');
+
 let downloadUrl = null;
 let currentJobId = null;
 let jobState = 'idle'; // idle, running, paused, cancelled, completed
+
+// Pricing constants (per million tokens)
+const modelPricing = {
+    'claude-haiku-4-5-20251001': {
+        name: 'Haiku 4.5',
+        inputPrice: 0.80,
+        outputPrice: 4.00
+    },
+    'claude-3-7-sonnet-20250219': {
+        name: 'Sonnet 3.7',
+        inputPrice: 3.00,
+        outputPrice: 15.00
+    },
+    'claude-sonnet-4-5-20250929': {
+        name: 'Sonnet 4.5',
+        inputPrice: 3.00,
+        outputPrice: 15.00,
+        // Sonnet 4.5 has dynamic pricing for prompts > 200K tokens
+        inputPriceOverLimit: 6.00,
+        outputPriceOverLimit: 22.50,
+        tokenLimitThreshold: 200000,
+        isDynamic: true
+    },
+    'claude-opus-4-1-20250805': {
+        name: 'Opus 4.1',
+        inputPrice: 15.00,
+        outputPrice: 75.00
+    }
+};
+
+// Estimated tokens per transcript based on empirical data
+// These are conservative estimates
+const ESTIMATED_TOKENS_PER_TRANSCRIPT = {
+    input: 1500,   // Prompt tokens (fairly consistent)
+    output: 8000   // Generated content (25-30 min transcript)
+};
+
+// Model information and metadata
+const modelData = {
+    'claude-3-7-sonnet-20250219': {
+        name: 'Sonnet 3.7',
+        speed: '⚡⚡',
+        quality: '⭐⭐⭐',
+        cost: '💰💰',
+        description: 'Balanced performance - recommended for most use cases. Good quality with reasonable speed.'
+    },
+    'claude-sonnet-4-5-20250929': {
+        name: 'Sonnet 4.5',
+        speed: '⚡',
+        quality: '⭐⭐⭐⭐',
+        cost: '💰💰💰',
+        description: 'Highest quality generation. Produces excellent transcripts with natural dialogue.'
+    },
+    'claude-opus-4-1-20250805': {
+        name: 'Opus 4.1',
+        speed: '🐌',
+        quality: '⭐⭐⭐⭐⭐',
+        cost: '💰💰💰💰',
+        description: 'Premium quality but slowest. Best for when quality is paramount.'
+    },
+    'claude-haiku-4-5-20251001': {
+        name: 'Haiku 4.5',
+        speed: '⚡⚡⚡',
+        quality: '⭐⭐',
+        cost: '💰',
+        description: 'Fast and budget-friendly. Good for testing and high-volume generation.'
+    }
+};
 
 // Confirmation dialog helper
 function confirmAction(message) {
     return confirm(message);
 }
+
+// Cost estimation functions
+function formatTokens(tokens) {
+    if (tokens >= 1000000) {
+        return `${(tokens / 1000000).toFixed(2)}M`;
+    } else if (tokens >= 1000) {
+        return `${(tokens / 1000).toFixed(1)}K`;
+    } else {
+        return `${tokens}`;
+    }
+}
+
+function formatCost(cost) {
+    if (cost < 0.001) {
+        return `$${(cost * 1000000).toFixed(2)}µ`;
+    } else if (cost < 0.01) {
+        return `$${(cost * 1000).toFixed(2)}m`;
+    } else {
+        return `$${cost.toFixed(4)}`;
+    }
+}
+
+function estimatePromptTokens(text) {
+    // Rough estimation: ~4 characters per token for English text
+    // This is a conservative estimate; actual token count may vary
+    return Math.ceil(text.length / 4);
+}
+
+function estimateCost() {
+    const transcriptCount = parseInt(document.getElementById('transcriptCount').value) || 1;
+    const selectedModel = modelSelect.value;
+    const pricing = modelPricing[selectedModel];
+    const promptText = document.getElementById('prompt').value;
+
+    if (!pricing) return;
+
+    // Calculate series and single transcripts
+    const seriesCount = Math.floor(transcriptCount / 10);
+    const singlesCount = transcriptCount % 10;
+    const totalSeriesTranscripts = seriesCount * 4;
+    const totalTranscripts = totalSeriesTranscripts + singlesCount;
+
+    // Estimate prompt tokens from actual prompt text
+    const promptTokensPerRequest = estimatePromptTokens(promptText);
+
+    // Estimate total tokens per request (prompt + context for each transcript)
+    const tokensPerRequest = promptTokensPerRequest + ESTIMATED_TOKENS_PER_TRANSCRIPT.input;
+
+    // Estimate tokens (prompt is sent once per transcript, so multiply by transcript count)
+    const estimatedInputTokens = totalTranscripts * tokensPerRequest;
+    const estimatedOutputTokens = totalTranscripts * ESTIMATED_TOKENS_PER_TRANSCRIPT.output;
+
+    // Calculate costs - handle dynamic pricing for Sonnet 4.5
+    let inputPrice = pricing.inputPrice;
+    let outputPrice = pricing.outputPrice;
+    let pricingNote = '';
+
+    if (pricing.isDynamic && estimatedInputTokens > pricing.tokenLimitThreshold) {
+        inputPrice = pricing.inputPriceOverLimit;
+        outputPrice = pricing.outputPriceOverLimit;
+        pricingNote = `<p style="color: #e53e3e; font-weight: bold; margin-top: 12px;">⚠️ <strong>Higher pricing tier:</strong> This estimate uses ${pricing.name}'s higher pricing for prompts > 200K tokens ($${inputPrice}/M input, $${outputPrice}/M output)</p>`;
+    } else if (pricing.isDynamic) {
+        pricingNote = `<p style="color: #38a169; margin-top: 12px;">✓ <strong>Standard pricing:</strong> This estimate uses ${pricing.name}'s standard pricing ($${inputPrice}/M input, $${outputPrice}/M output)</p>`;
+    }
+
+    const inputCost = (estimatedInputTokens / 1000000) * inputPrice;
+    const outputCost = (estimatedOutputTokens / 1000000) * outputPrice;
+    const totalCost = inputCost + outputCost;
+
+    // Calculate token breakdown
+    const promptTokens = promptTokensPerRequest - ESTIMATED_TOKENS_PER_TRANSCRIPT.input;
+    const contextTokensTotal = totalTranscripts * ESTIMATED_TOKENS_PER_TRANSCRIPT.input;
+    const promptTokensTotal = totalTranscripts * promptTokens;
+
+    // Display estimate
+    const estimateHTML = `
+        <p><strong>Transcript Count:</strong> ${transcriptCount} (${seriesCount} series × 4 episodes + ${singlesCount} singles = ${totalTranscripts} total)</p>
+        <p><strong>Input Token Breakdown:</strong><br>
+           &nbsp;&nbsp;• Prompt: ${formatTokens(promptTokensTotal)}<br>
+           &nbsp;&nbsp;• Context/Combos: ${formatTokens(contextTokensTotal)}<br>
+           &nbsp;&nbsp;• Total: ${formatTokens(estimatedInputTokens)}</p>
+        <p><strong>Estimated Tokens:</strong> ${formatTokens(estimatedInputTokens)} input + ${formatTokens(estimatedOutputTokens)} output = ${formatTokens(estimatedInputTokens + estimatedOutputTokens)} total</p>
+        <p><strong>Estimated Cost:</strong> <strong>${formatCost(totalCost)}</strong> USD<br>
+           <span style="font-size: 11px; color: #718096;">(Input: ${formatCost(inputCost)} + Output: ${formatCost(outputCost)})</span></p>
+        ${pricingNote}
+        <p style="font-size: 12px; margin-top: 12px; color: #718096;">
+            💡 <em>Actual cost may vary based on prompt length and model response length. This is an estimate.</em>
+        </p>
+    `;
+
+    estimateDetails.innerHTML = estimateHTML;
+
+    // Show/hide estimate based on whether we have valid input
+    if (transcriptCount > 0) {
+        costEstimate.classList.remove('hidden');
+    }
+}
+
+// Model selection functions
+function updateModelInfo() {
+    const selectedModel = modelSelect.value;
+    const info = modelData[selectedModel];
+
+    if (info) {
+        modelInfo.innerHTML = `
+            <strong>${info.name}</strong><br>
+            Speed: ${info.speed} | Quality: ${info.quality} | Cost: ${info.cost}<br>
+            ${info.description}
+        `;
+    }
+
+    // Update cost estimate when model changes
+    estimateCost();
+}
+
+function saveModelPreference(modelId) {
+    localStorage.setItem('selectedTranscriptModel', modelId);
+}
+
+function loadModelPreference() {
+    const saved = localStorage.getItem('selectedTranscriptModel');
+    if (saved && modelData[saved]) {
+        modelSelect.value = saved;
+        updateModelInfo();
+    } else {
+        // Default to Sonnet 4.5 if no preference saved
+        modelSelect.value = 'claude-sonnet-4-5-20250929';
+        updateModelInfo();
+    }
+
+    // Show initial cost estimate
+    estimateCost();
+}
+
+// Initialize model preference on page load
+loadModelPreference();
+
+// Add event listener for model selection change
+modelSelect.addEventListener('change', () => {
+    updateModelInfo();
+    saveModelPreference(modelSelect.value);
+});
+
+// Add event listener for transcript count change
+document.getElementById('transcriptCount').addEventListener('change', () => {
+    estimateCost();
+});
+
+document.getElementById('transcriptCount').addEventListener('input', () => {
+    estimateCost();
+});
+
+// Add event listener for prompt text change
+document.getElementById('prompt').addEventListener('change', () => {
+    estimateCost();
+});
+
+document.getElementById('prompt').addEventListener('input', () => {
+    estimateCost();
+});
+
+// Add toggle functionality for cost estimate panel
+costEstimateToggle.addEventListener('click', () => {
+    const isExpanded = costEstimateToggle.classList.contains('expanded');
+
+    if (isExpanded) {
+        // Close
+        costEstimateToggle.classList.remove('expanded');
+        estimateDetails.classList.remove('expanded');
+    } else {
+        // Open
+        costEstimateToggle.classList.add('expanded');
+        estimateDetails.classList.add('expanded');
+    }
+});
 
 // Add event listeners for control buttons
 pauseBtn.addEventListener('click', async () => {
@@ -187,7 +436,8 @@ form.addEventListener('submit', async (e) => {
         apiKey: document.getElementById('apiKey').value,
         transcriptCount: parseInt(document.getElementById('transcriptCount').value),
         prompt: document.getElementById('prompt').value,
-        jobId: currentJobId
+        jobId: currentJobId,
+        model: modelSelect.value
     };
 
     totalCount.textContent = formData.transcriptCount;
@@ -234,13 +484,22 @@ form.addEventListener('submit', async (e) => {
                     } else if (data.type === 'progress') {
                         const percentage = (data.current / data.total) * 100;
                         progressBar.style.width = percentage + '%';
-                        progressText.textContent = `Generated ${data.current} of ${data.total} transcripts...`;
+
+                        let progressMsg = `Generated ${data.current} of ${data.total} transcripts...`;
+                        if (data.tokens && data.cost) {
+                            progressMsg += ` | ${data.tokens} tokens | ${data.cost}`;
+                        }
+                        progressText.textContent = progressMsg;
                         completedCount.textContent = data.current;
 
                         const statusItem = document.createElement('div');
                         statusItem.className = 'status-item';
                         const context = data.context ? ` (${data.context})` : '';
-                        statusItem.textContent = `✓ Generated: ${data.filename}${context}`;
+                        let statusMsg = `✓ Generated: ${data.filename}${context}`;
+                        if (data.tokens && data.cost) {
+                            statusMsg += ` | ${data.tokens} | ${data.cost}`;
+                        }
+                        statusItem.textContent = statusMsg;
                         statusLog.appendChild(statusItem);
                         statusLog.scrollTop = statusLog.scrollHeight;
                     } else if (data.type === 'complete') {
@@ -249,6 +508,20 @@ form.addEventListener('submit', async (e) => {
                         downloadUrl = data.downloadUrl;
                         jobState = 'completed';
                         updateControlButtons();
+
+                        // Add final cost summary to status log
+                        if (data.stats && data.stats.cost) {
+                            const costSummary = document.createElement('div');
+                            costSummary.className = 'status-item success';
+                            const costData = data.stats.cost;
+                            costSummary.innerHTML = `
+                                <strong>💰 Cost Summary</strong><br>
+                                Input Tokens: ${costData.inputTokens.toLocaleString()} | Output Tokens: ${costData.outputTokens.toLocaleString()} | Total: ${costData.formattedTokens}<br>
+                                Input Cost: $${costData.inputCost.toFixed(6)} | Output Cost: $${costData.outputCost.toFixed(6)} | Total: <strong>${costData.formattedCost}</strong>
+                            `;
+                            statusLog.appendChild(costSummary);
+                            statusLog.scrollTop = statusLog.scrollHeight;
+                        }
 
                         setTimeout(() => {
                             progressContainer.classList.add('hidden');

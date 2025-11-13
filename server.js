@@ -3,11 +3,27 @@ const Anthropic = require('@anthropic-ai/sdk');
 const archiver = require('archiver');
 const fs = require('fs');
 const path = require('path');
+const pLimitModule = require('p-limit');
+const pLimit = pLimitModule.default;
 const { generateCombos } = require('./comboGenerator');
 const jobManager = require('./jobManager');
+const { calculateCost, extractUsage, formatCost, formatTokens } = require('./pricing');
 
 const app = express();
 const PORT = 3000;
+
+// Configuration for parallel generation (with environment variable overrides)
+const DEFAULT_CONCURRENCY = parseInt(process.env.TRANSCRIPT_CONCURRENCY || '5', 10); // Number of concurrent API requests (default: 5)
+const MAX_RETRIES = parseInt(process.env.TRANSCRIPT_MAX_RETRIES || '2', 10);
+const RETRY_DELAY_MS = parseInt(process.env.TRANSCRIPT_RETRY_DELAY_MS || '1000', 10);
+const RATE_LIMIT_DELAY_MS = parseInt(process.env.TRANSCRIPT_RATE_LIMIT_DELAY_MS || '500', 10); // Delay between API calls
+
+// Tracking for rate limit monitoring
+const apiCallMetrics = {
+    callsInLastMinute: 0,
+    lastResetTime: Date.now(),
+    rateLimitErrors: 0
+};
 
 // Middleware
 app.use(express.json({ limit: '50mb' }));
@@ -36,12 +52,95 @@ function generateRandomDate() {
     return randomDate.toISOString().split('T')[0];
 }
 
+// Helper function to retry API calls with exponential backoff
+async function retryWithBackoff(fn, maxRetries = MAX_RETRIES) {
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            lastError = error;
+
+            // Track rate limit errors
+            if (error.status === 429 || error.message?.includes('rate limit') || error.message?.includes('429')) {
+                apiCallMetrics.rateLimitErrors++;
+                console.warn(`⚠️ Rate limit hit (error #${apiCallMetrics.rateLimitErrors}). Retrying with backoff...`);
+            }
+
+            if (attempt < maxRetries) {
+                const delay = RETRY_DELAY_MS * Math.pow(2, attempt);
+                console.log(`Attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    throw lastError;
+}
+
+// Helper function to check job state and handle pause/cancel
+async function checkJobState(jobId) {
+    let job = jobManager.getJob(jobId);
+    if (!job || job.state === 'cancelled') {
+        return 'cancelled';
+    }
+
+    while (job.state === 'paused') {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        job = jobManager.getJob(jobId);
+        if (!job || job.state === 'cancelled') {
+            return 'cancelled';
+        }
+    }
+
+    return 'running';
+}
+
 // Main endpoint to generate transcripts
+// Supported models for transcript generation
+const SUPPORTED_TRANSCRIPT_MODELS = [
+    'claude-3-7-sonnet-20250219',
+    'claude-sonnet-4-5-20250929',
+    'claude-opus-4-1-20250805',
+    'claude-haiku-4-5-20251001'
+];
+
+// Token limits per model for transcript generation
+// Different models have different optimal token allocations
+const TOKEN_LIMITS_BY_MODEL = {
+    'claude-haiku-4-5-20251001': {
+        series: 7500,     // Haiku 4.5: maximize tokens for series (4 episodes)
+        single: 7500      // Haiku 4.5: use most of available tokens for complete transcripts
+    },
+    'claude-3-7-sonnet-20250219': {
+        series: 7500,     // Sonnet 3.7: good balance
+        single: 7000
+    },
+    'claude-sonnet-4-5-20250929': {
+        series: 7500,     // Sonnet 4.5: default high-quality
+        single: 7000
+    },
+    'claude-opus-4-1-20250805': {
+        series: 7500,     // Opus: premium quality, can use more tokens
+        single: 7000
+    }
+};
+
+// Helper function to get token limits for a specific model
+function getTokenLimits(model) {
+    return TOKEN_LIMITS_BY_MODEL[model] || { series: 7500, single: 7000 };
+}
+
 app.post('/generate', async (req, res) => {
-    const { apiKey, transcriptCount, prompt, jobId } = req.body;
+    const { apiKey, transcriptCount, prompt, jobId, model } = req.body;
 
     if (!apiKey || !transcriptCount || !prompt || !jobId) {
         return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Validate and set model (default to Sonnet 4.5 if not provided)
+    let selectedModel = model || 'claude-sonnet-4-5-20250929';
+    if (!SUPPORTED_TRANSCRIPT_MODELS.includes(selectedModel)) {
+        return res.status(400).json({ error: `Unsupported model: ${selectedModel}` });
     }
 
     // Set headers for Server-Sent Events
@@ -72,6 +171,14 @@ app.post('/generate', async (req, res) => {
 
         // Update job in manager with actual combos
         jobManager.createJob(jobId, transcriptCount, combos);
+
+        // Initialize cost tracking for this job
+        const costTracking = {
+            usageRecords: [],
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+            totalCost: 0
+        };
 
         res.write(`data: ${JSON.stringify({
             type: 'status',
@@ -107,28 +214,23 @@ app.post('/generate', async (req, res) => {
 
         let currentProgress = 0;
         const totalItems = transcriptCount;
+        const limit = pLimit(DEFAULT_CONCURRENCY);
+        const rateLimitQueue = { lastCall: Date.now() }; // Track last API call for rate limiting
 
-        // Step 3: Generate series transcripts together (to maintain context and conversation flow)
-        for (const [seriesId, seriesEpisodes] of seriesMap) {
-            // Check if job was cancelled or paused
-            let job = jobManager.getJob(jobId);
-            if (!job || job.state === 'cancelled') {
-                res.write(`data: ${JSON.stringify({
-                    type: 'status',
-                    message: 'Generation cancelled'
-                })}\n\n`);
-                res.end();
-                return;
+        // Helper function to apply rate limiting delay
+        const applyRateLimit = async () => {
+            const timeSinceLastCall = Date.now() - rateLimitQueue.lastCall;
+            if (timeSinceLastCall < RATE_LIMIT_DELAY_MS) {
+                await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS - timeSinceLastCall));
             }
+            rateLimitQueue.lastCall = Date.now();
+        };
 
-            // Wait if paused
-            while (job.state === 'paused') {
-                await new Promise(resolve => setTimeout(resolve, 500));
-                job = jobManager.getJob(jobId);
-                if (!job || job.state === 'cancelled') {
-                    res.end();
-                    return;
-                }
+        // Helper function to generate series with error tracking
+        const generateSeries = async (seriesId, seriesEpisodes) => {
+            const state = await checkJobState(jobId);
+            if (state === 'cancelled') {
+                throw new Error('Job cancelled');
             }
 
             try {
@@ -159,19 +261,34 @@ Generate all 4 episodes. Each episode should be 25-30 minutes of conversation wi
 - Different dates for each episode (weekly intervals)
 - Format each episode separately with clear episode markers`;
 
-                const message = await anthropic.messages.create({
-                    model: 'claude-sonnet-4-5-20250929',
-                    max_tokens: 32000,
-                    messages: [{
-                        role: 'user',
-                        content: seriesPrompt
-                    }]
+                const tokenLimits = getTokenLimits(selectedModel);
+                await applyRateLimit();
+                const message = await retryWithBackoff(async () => {
+                    return await anthropic.messages.create({
+                        model: selectedModel,
+                        max_tokens: tokenLimits.series,
+                        messages: [{
+                            role: 'user',
+                            content: seriesPrompt
+                        }]
+                    });
+
                 });
+
+                // Extract and track token usage
+                const usage = extractUsage(message);
+                costTracking.usageRecords.push({
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
+                    model: selectedModel,
+                    type: 'series'
+                });
+                costTracking.totalInputTokens += usage.inputTokens;
+                costTracking.totalOutputTokens += usage.outputTokens;
 
                 const seriesContent = message.content[0].text;
 
                 // Split the response into individual episodes and save them
-                // Episodes are marked in the content
                 const episodes = splitSeriesContent(seriesContent, seriesEpisodes);
 
                 for (let episodeIdx = 0; episodeIdx < episodes.length; episodeIdx++) {
@@ -188,51 +305,38 @@ Generate all 4 episodes. Each episode should be 25-30 minutes of conversation wi
                     jobManager.updateProgress(jobId, currentProgress, filename);
 
                     currentProgress++;
+
+                    // Calculate current cumulative cost
+                    const currentCost = calculateCost(
+                        costTracking.totalInputTokens,
+                        costTracking.totalOutputTokens,
+                        selectedModel
+                    );
+                    costTracking.totalCost = currentCost.totalCost;
+
                     res.write(`data: ${JSON.stringify({
                         type: 'progress',
                         current: currentProgress,
                         total: totalItems,
                         filename: filename,
-                        context: `Series "${coach} & ${client}" - Episode ${episode.episodeNumber}/4`
+                        context: `Series "${coach} & ${client}" - Episode ${episode.episodeNumber}/4`,
+                        tokens: formatTokens(currentCost.totalTokens),
+                        cost: formatCost(currentCost.totalCost)
                     })}\n\n`);
-
-                    // Delay between writing files
-                    if (currentProgress < totalItems) {
-                        await new Promise(resolve => setTimeout(resolve, 500));
-                    }
                 }
 
+                return { success: true, seriesId };
             } catch (error) {
                 console.error(`Error generating series ${seriesId}:`, error);
-                res.write(`data: ${JSON.stringify({
-                    type: 'error',
-                    message: `Failed to generate series ${seriesId}: ${error.message}`
-                })}\n\n`);
-                throw error;
+                return { success: false, seriesId, error: error.message };
             }
-        }
+        };
 
-        // Step 4: Generate single transcripts
-        for (const singleCombo of singleTranscripts) {
-            // Check if job was cancelled or paused
-            let job = jobManager.getJob(jobId);
-            if (!job || job.state === 'cancelled') {
-                res.write(`data: ${JSON.stringify({
-                    type: 'status',
-                    message: 'Generation cancelled'
-                })}\n\n`);
-                res.end();
-                return;
-            }
-
-            // Wait if paused
-            while (job.state === 'paused') {
-                await new Promise(resolve => setTimeout(resolve, 500));
-                job = jobManager.getJob(jobId);
-                if (!job || job.state === 'cancelled') {
-                    res.end();
-                    return;
-                }
+        // Helper function to generate single transcript with error tracking
+        const generateSingle = async (singleCombo, index) => {
+            const state = await checkJobState(jobId);
+            if (state === 'cancelled') {
+                throw new Error('Job cancelled');
             }
 
             try {
@@ -245,14 +349,29 @@ Coaching Niche/Focus: ${singleCombo.niche}
 
 Generate ONE standalone transcript for this single coaching session (not part of a series). This should be a complete 25-30 minute conversation with realistic dialogue, timestamps, and details.`;
 
-                const message = await anthropic.messages.create({
-                    model: 'claude-sonnet-4-5-20250929',
-                    max_tokens: 16000,
-                    messages: [{
-                        role: 'user',
-                        content: singlePrompt
-                    }]
+                 const tokenLimits = getTokenLimits(selectedModel);
+                await applyRateLimit();
+                const message = await retryWithBackoff(async () => {
+                    return await anthropic.messages.create({
+                        model: selectedModel,
+                        max_tokens: tokenLimits.single,
+                        messages: [{
+                            role: 'user',
+                            content: singlePrompt
+                        }]
+                    });
                 });
+
+                // Extract and track token usage
+                const usage = extractUsage(message);
+                costTracking.usageRecords.push({
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
+                    model: selectedModel,
+                    type: 'single'
+                });
+                costTracking.totalInputTokens += usage.inputTokens;
+                costTracking.totalOutputTokens += usage.outputTokens;
 
                 const transcriptContent = message.content[0].text;
                 const date = generateRandomDate();
@@ -265,27 +384,71 @@ Generate ONE standalone transcript for this single coaching session (not part of
                 jobManager.updateProgress(jobId, currentProgress, filename);
 
                 currentProgress++;
+
+                // Calculate current cumulative cost
+                const currentCost = calculateCost(
+                    costTracking.totalInputTokens,
+                    costTracking.totalOutputTokens,
+                    selectedModel
+                );
+                costTracking.totalCost = currentCost.totalCost;
+
                 res.write(`data: ${JSON.stringify({
                     type: 'progress',
                     current: currentProgress,
                     total: totalItems,
-                    filename: filename
+                    filename: filename,
+                    tokens: formatTokens(currentCost.totalTokens),
+                    cost: formatCost(currentCost.totalCost)
                 })}\n\n`);
 
-                // Small delay to avoid rate limiting
-                if (currentProgress < totalItems) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
-
+                return { success: true, index };
             } catch (error) {
-                console.error(`Error generating single transcript:`, error);
+                console.error(`Error generating single transcript at index ${index}:`, error);
+                return { success: false, index, error: error.message };
+            }
+        };
+
+        // Step 3: Generate series transcripts in parallel
+        res.write(`data: ${JSON.stringify({
+            type: 'status',
+            message: `Starting parallel generation with ${DEFAULT_CONCURRENCY} concurrent requests...`
+        })}\n\n`);
+
+        const seriesPromises = Array.from(seriesMap.entries()).map(([seriesId, episodes]) =>
+            limit(() => generateSeries(seriesId, episodes))
+        );
+
+        const seriesResults = await Promise.all(seriesPromises);
+
+        // Check for series generation errors
+        const seriesErrors = seriesResults.filter(r => !r.success);
+        if (seriesErrors.length > 0) {
+            console.warn(`${seriesErrors.length} series failed to generate`);
+            for (const error of seriesErrors) {
                 res.write(`data: ${JSON.stringify({
                     type: 'error',
-                    message: `Failed to generate transcript: ${error.message}`
+                    message: `Failed to generate series ${error.seriesId}: ${error.error}`
                 })}\n\n`);
-                jobManager.cancelJob(jobId);
-                res.end();
-                return;
+            }
+        }
+
+        // Step 4: Generate single transcripts in parallel
+        const singlePromises = singleTranscripts.map((combo, index) =>
+            limit(() => generateSingle(combo, index))
+        );
+
+        const singleResults = await Promise.all(singlePromises);
+
+        // Check for single generation errors
+        const singleErrors = singleResults.filter(r => !r.success);
+        if (singleErrors.length > 0) {
+            console.warn(`${singleErrors.length} single transcripts failed to generate`);
+            for (const error of singleErrors) {
+                res.write(`data: ${JSON.stringify({
+                    type: 'error',
+                    message: `Failed to generate transcript at index ${error.index}: ${error.error}`
+                })}\n\n`);
             }
         }
 
@@ -298,10 +461,52 @@ Generate ONE standalone transcript for this single coaching session (not part of
         // Mark job as completed
         jobManager.completeJob(jobId);
 
-        // Send completion message
+        // Calculate and report performance metrics
+        const stats = jobManager.getJobStats(jobId);
+        const totalTime = (stats.elapsedTime / 1000).toFixed(2);
+        const avgTimePerTranscript = (stats.elapsedTime / stats.totalCount).toFixed(2);
+
+        console.log(`\n✅ Generation Complete!`);
+        console.log(`   Concurrency: ${DEFAULT_CONCURRENCY} concurrent requests`);
+        console.log(`   Transcripts: ${stats.totalCount}`);
+        console.log(`   Total Time: ${totalTime}s`);
+        console.log(`   Avg per Transcript: ${avgTimePerTranscript}ms`);
+        if (apiCallMetrics.rateLimitErrors > 0) {
+            console.log(`   ⚠️ Rate Limit Errors: ${apiCallMetrics.rateLimitErrors}`);
+        }
+        console.log('');
+
+        // Send completion message with cost breakdown
+        const finalCost = calculateCost(
+            costTracking.totalInputTokens,
+            costTracking.totalOutputTokens,
+            selectedModel
+        );
+
+        console.log(`   Input Tokens: ${formatTokens(finalCost.inputTokens)}`);
+        console.log(`   Output Tokens: ${formatTokens(finalCost.outputTokens)}`);
+        console.log(`   Total Tokens: ${formatTokens(finalCost.totalTokens)}`);
+        console.log(`   Total Cost: ${formatCost(finalCost.totalCost)}`);
+
         res.write(`data: ${JSON.stringify({
             type: 'complete',
-            downloadUrl: `/download/${zipFilename}`
+            downloadUrl: `/download/${zipFilename}`,
+            stats: {
+                concurrency: DEFAULT_CONCURRENCY,
+                totalTime: parseFloat(totalTime),
+                avgTimePerTranscript: parseFloat(avgTimePerTranscript),
+                rateLimitErrors: apiCallMetrics.rateLimitErrors,
+                cost: {
+                    inputTokens: finalCost.inputTokens,
+                    outputTokens: finalCost.outputTokens,
+                    totalTokens: finalCost.totalTokens,
+                    inputCost: finalCost.inputCost,
+                    outputCost: finalCost.outputCost,
+                    totalCost: finalCost.totalCost,
+                    formattedCost: formatCost(finalCost.totalCost),
+                    formattedTokens: formatTokens(finalCost.totalTokens)
+                }
+            }
         })}\n\n`);
 
         res.end();
@@ -325,7 +530,13 @@ Generate ONE standalone transcript for this single coaching session (not part of
         if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true });
         }
-        jobManager.cancelJob(jobId);
+
+        // Try to cancel job if it exists (it may not exist if error occurred during combo generation)
+        try {
+            jobManager.cancelJob(jobId);
+        } catch (cancelError) {
+            // Job might not exist yet, that's okay
+        }
     }
 });
 
