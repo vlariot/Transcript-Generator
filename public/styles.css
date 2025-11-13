@@ -353,3 +353,77 @@ button:disabled {
 .model-info strong {
     color: #2d3748;
 }
+
+.cost-estimate {
+    background: linear-gradient(135deg, #f0f4ff 0%, #f8f0ff 100%);
+    border: 2px solid #667eea;
+    border-radius: 8px;
+    margin: 24px 0;
+    overflow: hidden;
+}
+
+.cost-estimate.hidden {
+    display: none;
+}
+
+.cost-estimate-toggle {
+    width: 100%;
+    padding: 14px 16px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    transition: all 0.3s ease;
+    text-align: left;
+}
+
+.cost-estimate-toggle:hover {
+    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+    transform: translateY(-1px);
+}
+
+.toggle-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    transition: transform 0.3s ease;
+    font-size: 12px;
+}
+
+.cost-estimate-toggle.expanded .toggle-icon {
+    transform: rotate(90deg);
+}
+
+.estimate-details {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+    padding: 0 16px;
+}
+
+.estimate-details.expanded {
+    max-height: 1000px;
+    padding: 16px;
+}
+
+.estimate-details {
+    color: #2d3748;
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.estimate-details p {
+    margin: 8px 0;
+}
+
+.estimate-details strong {
+    color: #764ba2;
+}

@@ -7,6 +7,7 @@ const pLimitModule = require('p-limit');
 const pLimit = pLimitModule.default;
 const { generateCombos } = require('./comboGenerator');
 const jobManager = require('./jobManager');
+const { calculateCost, extractUsage, formatCost, formatTokens } = require('./pricing');
 
 const app = express();
 const PORT = 3000;
@@ -97,21 +98,21 @@ async function checkJobState(jobId) {
 // Main endpoint to generate transcripts
 // Supported models for transcript generation
 const SUPPORTED_TRANSCRIPT_MODELS = [
-    'claude-3-5-sonnet-20241022',
+    'claude-3-7-sonnet-20250219',
     'claude-sonnet-4-5-20250929',
     'claude-opus-4-1-20250805',
-    'claude-3-5-haiku-20241022'
+    'claude-haiku-4-5-20251001'
 ];
 
 // Token limits per model for transcript generation
 // Different models have different optimal token allocations
 const TOKEN_LIMITS_BY_MODEL = {
-    'claude-3-5-haiku-20241022': {
-        series: 7500,     // Haiku: maximize tokens for series (4 episodes)
-        single: 7500      // Haiku: use most of available tokens for complete transcripts
+    'claude-haiku-4-5-20251001': {
+        series: 7500,     // Haiku 4.5: maximize tokens for series (4 episodes)
+        single: 7500      // Haiku 4.5: use most of available tokens for complete transcripts
     },
-    'claude-3-5-sonnet-20241022': {
-        series: 7500,     // Sonnet 3.5: good balance
+    'claude-3-7-sonnet-20250219': {
+        series: 7500,     // Sonnet 3.7: good balance
         single: 7000
     },
     'claude-sonnet-4-5-20250929': {
@@ -170,6 +171,14 @@ app.post('/generate', async (req, res) => {
 
         // Update job in manager with actual combos
         jobManager.createJob(jobId, transcriptCount, combos);
+
+        // Initialize cost tracking for this job
+        const costTracking = {
+            usageRecords: [],
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+            totalCost: 0
+        };
 
         res.write(`data: ${JSON.stringify({
             type: 'status',
@@ -266,6 +275,17 @@ Generate all 4 episodes. Each episode should be 25-30 minutes of conversation wi
 
                 });
 
+                // Extract and track token usage
+                const usage = extractUsage(message);
+                costTracking.usageRecords.push({
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
+                    model: selectedModel,
+                    type: 'series'
+                });
+                costTracking.totalInputTokens += usage.inputTokens;
+                costTracking.totalOutputTokens += usage.outputTokens;
+
                 const seriesContent = message.content[0].text;
 
                 // Split the response into individual episodes and save them
@@ -285,12 +305,23 @@ Generate all 4 episodes. Each episode should be 25-30 minutes of conversation wi
                     jobManager.updateProgress(jobId, currentProgress, filename);
 
                     currentProgress++;
+
+                    // Calculate current cumulative cost
+                    const currentCost = calculateCost(
+                        costTracking.totalInputTokens,
+                        costTracking.totalOutputTokens,
+                        selectedModel
+                    );
+                    costTracking.totalCost = currentCost.totalCost;
+
                     res.write(`data: ${JSON.stringify({
                         type: 'progress',
                         current: currentProgress,
                         total: totalItems,
                         filename: filename,
-                        context: `Series "${coach} & ${client}" - Episode ${episode.episodeNumber}/4`
+                        context: `Series "${coach} & ${client}" - Episode ${episode.episodeNumber}/4`,
+                        tokens: formatTokens(currentCost.totalTokens),
+                        cost: formatCost(currentCost.totalCost)
                     })}\n\n`);
                 }
 
@@ -331,6 +362,17 @@ Generate ONE standalone transcript for this single coaching session (not part of
                     });
                 });
 
+                // Extract and track token usage
+                const usage = extractUsage(message);
+                costTracking.usageRecords.push({
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
+                    model: selectedModel,
+                    type: 'single'
+                });
+                costTracking.totalInputTokens += usage.inputTokens;
+                costTracking.totalOutputTokens += usage.outputTokens;
+
                 const transcriptContent = message.content[0].text;
                 const date = generateRandomDate();
                 const filename = `${sanitizeFilename(singleCombo.coach)}_${sanitizeFilename(singleCombo.client)}_${date}_single.md`;
@@ -342,11 +384,22 @@ Generate ONE standalone transcript for this single coaching session (not part of
                 jobManager.updateProgress(jobId, currentProgress, filename);
 
                 currentProgress++;
+
+                // Calculate current cumulative cost
+                const currentCost = calculateCost(
+                    costTracking.totalInputTokens,
+                    costTracking.totalOutputTokens,
+                    selectedModel
+                );
+                costTracking.totalCost = currentCost.totalCost;
+
                 res.write(`data: ${JSON.stringify({
                     type: 'progress',
                     current: currentProgress,
                     total: totalItems,
-                    filename: filename
+                    filename: filename,
+                    tokens: formatTokens(currentCost.totalTokens),
+                    cost: formatCost(currentCost.totalCost)
                 })}\n\n`);
 
                 return { success: true, index };
@@ -423,7 +476,18 @@ Generate ONE standalone transcript for this single coaching session (not part of
         }
         console.log('');
 
-        // Send completion message
+        // Send completion message with cost breakdown
+        const finalCost = calculateCost(
+            costTracking.totalInputTokens,
+            costTracking.totalOutputTokens,
+            selectedModel
+        );
+
+        console.log(`   Input Tokens: ${formatTokens(finalCost.inputTokens)}`);
+        console.log(`   Output Tokens: ${formatTokens(finalCost.outputTokens)}`);
+        console.log(`   Total Tokens: ${formatTokens(finalCost.totalTokens)}`);
+        console.log(`   Total Cost: ${formatCost(finalCost.totalCost)}`);
+
         res.write(`data: ${JSON.stringify({
             type: 'complete',
             downloadUrl: `/download/${zipFilename}`,
@@ -431,7 +495,17 @@ Generate ONE standalone transcript for this single coaching session (not part of
                 concurrency: DEFAULT_CONCURRENCY,
                 totalTime: parseFloat(totalTime),
                 avgTimePerTranscript: parseFloat(avgTimePerTranscript),
-                rateLimitErrors: apiCallMetrics.rateLimitErrors
+                rateLimitErrors: apiCallMetrics.rateLimitErrors,
+                cost: {
+                    inputTokens: finalCost.inputTokens,
+                    outputTokens: finalCost.outputTokens,
+                    totalTokens: finalCost.totalTokens,
+                    inputCost: finalCost.inputCost,
+                    outputCost: finalCost.outputCost,
+                    totalCost: finalCost.totalCost,
+                    formattedCost: formatCost(finalCost.totalCost),
+                    formattedTokens: formatTokens(finalCost.totalTokens)
+                }
             }
         })}\n\n`);
 
