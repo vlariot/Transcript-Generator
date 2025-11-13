@@ -47,6 +47,7 @@ label {
 input[type="text"],
 input[type="password"],
 input[type="number"],
+select,
 textarea {
     width: 100%;
     padding: 12px;
@@ -60,9 +61,19 @@ textarea {
 input[type="text"]:focus,
 input[type="password"]:focus,
 input[type="number"]:focus,
+select:focus,
 textarea:focus {
     outline: none;
     border-color: #667eea;
+}
+
+select {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23667eea' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 36px;
+    cursor: pointer;
 }
 
 textarea {
@@ -326,4 +337,19 @@ button:disabled {
 .status-item.warning {
     color: #f59e0b;
     font-weight: 500;
+}
+
+.model-info {
+    margin-top: 12px;
+    padding: 12px;
+    background: #f0f4ff;
+    border-left: 4px solid #667eea;
+    border-radius: 6px;
+    font-size: 13px;
+    color: #4a5568;
+    line-height: 1.5;
+}
+
+.model-info strong {
+    color: #2d3748;
 }

@@ -95,11 +95,51 @@ async function checkJobState(jobId) {
 }
 
 // Main endpoint to generate transcripts
+// Supported models for transcript generation
+const SUPPORTED_TRANSCRIPT_MODELS = [
+    'claude-3-5-sonnet-20241022',
+    'claude-sonnet-4-5-20250929',
+    'claude-opus-4-1-20250805',
+    'claude-3-5-haiku-20241022'
+];
+
+// Token limits per model for transcript generation
+// Different models have different optimal token allocations
+const TOKEN_LIMITS_BY_MODEL = {
+    'claude-3-5-haiku-20241022': {
+        series: 7500,     // Haiku: maximize tokens for series (4 episodes)
+        single: 7500      // Haiku: use most of available tokens for complete transcripts
+    },
+    'claude-3-5-sonnet-20241022': {
+        series: 7500,     // Sonnet 3.5: good balance
+        single: 7000
+    },
+    'claude-sonnet-4-5-20250929': {
+        series: 7500,     // Sonnet 4.5: default high-quality
+        single: 7000
+    },
+    'claude-opus-4-1-20250805': {
+        series: 7500,     // Opus: premium quality, can use more tokens
+        single: 7000
+    }
+};
+
+// Helper function to get token limits for a specific model
+function getTokenLimits(model) {
+    return TOKEN_LIMITS_BY_MODEL[model] || { series: 7500, single: 7000 };
+}
+
 app.post('/generate', async (req, res) => {
-    const { apiKey, transcriptCount, prompt, jobId } = req.body;
+    const { apiKey, transcriptCount, prompt, jobId, model } = req.body;
 
     if (!apiKey || !transcriptCount || !prompt || !jobId) {
         return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Validate and set model (default to Sonnet 4.5 if not provided)
+    let selectedModel = model || 'claude-sonnet-4-5-20250929';
+    if (!SUPPORTED_TRANSCRIPT_MODELS.includes(selectedModel)) {
+        return res.status(400).json({ error: `Unsupported model: ${selectedModel}` });
     }
 
     // Set headers for Server-Sent Events
@@ -212,16 +252,18 @@ Generate all 4 episodes. Each episode should be 25-30 minutes of conversation wi
 - Different dates for each episode (weekly intervals)
 - Format each episode separately with clear episode markers`;
 
+                const tokenLimits = getTokenLimits(selectedModel);
                 await applyRateLimit();
                 const message = await retryWithBackoff(async () => {
                     return await anthropic.messages.create({
-                        model: 'claude-sonnet-4-5-20250929',
-                        max_tokens: 32000,
+                        model: selectedModel,
+                        max_tokens: tokenLimits.series,
                         messages: [{
                             role: 'user',
                             content: seriesPrompt
                         }]
                     });
+
                 });
 
                 const seriesContent = message.content[0].text;
@@ -276,17 +318,17 @@ Coaching Niche/Focus: ${singleCombo.niche}
 
 Generate ONE standalone transcript for this single coaching session (not part of a series). This should be a complete 25-30 minute conversation with realistic dialogue, timestamps, and details.`;
 
+                 const tokenLimits = getTokenLimits(selectedModel);
                 await applyRateLimit();
                 const message = await retryWithBackoff(async () => {
                     return await anthropic.messages.create({
-                        model: 'claude-sonnet-4-5-20250929',
-                        max_tokens: 16000,
+                        model: selectedModel,
+                        max_tokens: tokenLimits.single,
                         messages: [{
                             role: 'user',
                             content: singlePrompt
                         }]
                     });
-                });
 
                 const transcriptContent = message.content[0].text;
                 const date = generateRandomDate();
@@ -413,7 +455,13 @@ Generate ONE standalone transcript for this single coaching session (not part of
         if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true });
         }
-        jobManager.cancelJob(jobId);
+
+        // Try to cancel job if it exists (it may not exist if error occurred during combo generation)
+        try {
+            jobManager.cancelJob(jobId);
+        } catch (cancelError) {
+            // Job might not exist yet, that's okay
+        }
     }
 });
 
