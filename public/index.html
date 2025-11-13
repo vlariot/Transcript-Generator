@@ -27,6 +27,18 @@
             </div>
 
             <div class="form-group">
+                <label for="modelSelect">Transcript Generation Model:</label>
+                <select id="modelSelect" name="modelSelect" required>
+                    <option value="claude-3-5-sonnet-20241022">Sonnet 3.5 (Balanced - Recommended)</option>
+                    <option value="claude-sonnet-4-5-20250929">Sonnet 4.5 (Best Quality - Default)</option>
+                    <option value="claude-opus-4-1-20250805">Opus (Premium Quality - Slowest)</option>
+                    <option value="claude-3-5-haiku-20241022">Haiku (Fast & Budget - Lowest Quality)</option>
+                </select>
+                <small>Choose a model based on your needs. Haiku is fastest/cheapest, Sonnet is balanced, Opus is highest quality</small>
+                <div id="modelInfo" class="model-info"></div>
+            </div>
+
+            <div class="form-group">
                 <label for="prompt">Generation Prompt:</label>
                 <textarea id="prompt" name="prompt" rows="15" required>I am a real estate business owner creating dummy transcripts to test PII redaction tools. These are transcripts from 1:1 coaching calls where coaches and clients discuss real estate business growth.
 

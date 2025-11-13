@@ -21,14 +21,88 @@ const pauseBtn = document.getElementById('pauseBtn');
 const resumeBtn = document.getElementById('resumeBtn');
 const cancelBtn = document.getElementById('cancelBtn');
 
+const modelSelect = document.getElementById('modelSelect');
+const modelInfo = document.getElementById('modelInfo');
+
 let downloadUrl = null;
 let currentJobId = null;
 let jobState = 'idle'; // idle, running, paused, cancelled, completed
+
+// Model information and metadata
+const modelData = {
+    'claude-3-5-sonnet-20241022': {
+        name: 'Sonnet 3.5',
+        speed: '⚡⚡',
+        quality: '⭐⭐⭐',
+        cost: '💰💰',
+        description: 'Balanced performance - recommended for most use cases. Good quality with reasonable speed.'
+    },
+    'claude-sonnet-4-5-20250929': {
+        name: 'Sonnet 4.5',
+        speed: '⚡',
+        quality: '⭐⭐⭐⭐',
+        cost: '💰💰💰',
+        description: 'Highest quality generation. Produces excellent transcripts with natural dialogue.'
+    },
+    'claude-opus-4-1-20250805': {
+        name: 'Opus',
+        speed: '🐌',
+        quality: '⭐⭐⭐⭐⭐',
+        cost: '💰💰💰💰',
+        description: 'Premium quality but slowest. Best for when quality is paramount.'
+    },
+    'claude-3-5-haiku-20241022': {
+        name: 'Haiku',
+        speed: '⚡⚡⚡',
+        quality: '⭐⭐',
+        cost: '💰',
+        description: 'Fast and budget-friendly. Good for testing and high-volume generation.'
+    }
+};
 
 // Confirmation dialog helper
 function confirmAction(message) {
     return confirm(message);
 }
+
+// Model selection functions
+function updateModelInfo() {
+    const selectedModel = modelSelect.value;
+    const info = modelData[selectedModel];
+
+    if (info) {
+        modelInfo.innerHTML = `
+            <strong>${info.name}</strong><br>
+            Speed: ${info.speed} | Quality: ${info.quality} | Cost: ${info.cost}<br>
+            ${info.description}
+        `;
+    }
+}
+
+function saveModelPreference(modelId) {
+    localStorage.setItem('selectedTranscriptModel', modelId);
+}
+
+function loadModelPreference() {
+    const saved = localStorage.getItem('selectedTranscriptModel');
+    if (saved && modelData[saved]) {
+        modelSelect.value = saved;
+        updateModelInfo();
+    } else {
+        // Default to Sonnet 4.5 if no preference saved
+        modelSelect.value = 'claude-sonnet-4-5-20250929';
+        updateModelInfo();
+    }
+}
+
+// Initialize model preference on page load
+loadModelPreference();
+
+// Add event listener for model selection change
+modelSelect.addEventListener('change', () => {
+    updateModelInfo();
+    saveModelPreference(modelSelect.value);
+});
 
 // Add event listeners for control buttons
 pauseBtn.addEventListener('click', async () => {
@@ -187,7 +261,8 @@ form.addEventListener('submit', async (e) => {
         apiKey: document.getElementById('apiKey').value,
         transcriptCount: parseInt(document.getElementById('transcriptCount').value),
         prompt: document.getElementById('prompt').value,
-        jobId: currentJobId
+        jobId: currentJobId,
+        model: modelSelect.value
     };
 
     totalCount.textContent = formData.transcriptCount;

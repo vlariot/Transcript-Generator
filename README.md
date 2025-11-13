@@ -52,12 +52,18 @@ A web application that generates realistic real estate coaching call transcripts
 3. **Fill in the form:**
    - **Claude API Key:** Enter your Anthropic API key
    - **Number of Transcripts:** Choose how many transcripts to generate (1-100)
+   - **Transcript Generation Model:** Select your preferred Claude model based on your needs:
+     - **Haiku**: Fastest and most budget-friendly. Ideal for testing and high-volume generation
+     - **Sonnet 3.5**: Balanced performance with good quality. Recommended for most use cases
+     - **Sonnet 4.5**: High-quality output (default). Better quality transcripts with reasonable speed
+     - **Opus**: Premium quality, slowest generation. Best when quality is paramount
    - **Generation Prompt:** The prompt is pre-filled with the specifications. You can modify it if needed.
 
 4. **Generate:**
    - Click "Generate Transcripts"
    - Watch the progress bar as transcripts are created
    - When complete, download the ZIP file containing all transcripts
+   - Your model preference is saved automatically for future sessions
 
 ## Output Format
 
@@ -168,16 +174,21 @@ Edit the default prompt in `public/index.html` (line 35) to change:
 - Geographic locations
 - Number of follow-up series
 
-### Change AI Model
-Edit `server.js` (line 81) to use a different Claude model:
-```javascript
-model: 'claude-3-5-sonnet-20241022',  // Change this
-```
+### Model Selection
 
-Available models:
-- `claude-3-5-sonnet-20241022` (recommended - best balance)
-- `claude-3-opus-20240229` (highest quality, slower)
-- `claude-3-haiku-20240307` (fastest, lower cost)
+The application now supports multiple Claude models for transcript generation. You can select your preferred model directly from the web interface:
+
+**Available Models:**
+- **Haiku** (`claude-3-5-haiku-20241022`): Fastest and most budget-friendly. Ideal for testing and high-volume generation.
+- **Sonnet 3.5** (`claude-3-5-sonnet-20241022`): Balanced performance with good quality. Recommended for most use cases.
+- **Sonnet 4.5** (`claude-sonnet-4-5-20250929`): High-quality output (default). Better quality transcripts with reasonable speed.
+- **Opus** (`claude-opus-4-1-20250805`): Premium quality, slowest generation. Best when quality is paramount.
+
+**Model Selection Features:**
+- Select your model from the dropdown on the generation form
+- Your preference is saved automatically and restored on future visits (via localStorage)
+- Each model is clearly labeled with speed, quality, and cost indicators
+- Haiku is used internally for coach/client combo generation (optimized for speed)
 
 ## License
 
