@@ -108,26 +108,26 @@ const SUPPORTED_TRANSCRIPT_MODELS = [
 // Different models have different optimal token allocations
 const TOKEN_LIMITS_BY_MODEL = {
     'claude-haiku-4-5-20251001': {
-        series: 7500,     // Haiku 4.5: maximize tokens for series (4 episodes)
-        single: 7500      // Haiku 4.5: use most of available tokens for complete transcripts
+        series: 32000,    // Haiku 4.5: 4 episodes × ~8K tokens each
+        single: 8000      // Haiku 4.5: single complete transcript
     },
     'claude-3-7-sonnet-20250219': {
-        series: 7500,     // Sonnet 3.7: good balance
-        single: 7000
+        series: 32000,    // Sonnet 3.7: 4 episodes × ~8K tokens each
+        single: 8000
     },
     'claude-sonnet-4-5-20250929': {
-        series: 7500,     // Sonnet 4.5: default high-quality
-        single: 7000
+        series: 32000,    // Sonnet 4.5: 4 episodes × ~8K tokens each
+        single: 8000
     },
     'claude-opus-4-1-20250805': {
-        series: 7500,     // Opus: premium quality, can use more tokens
-        single: 7000
+        series: 32000,    // Opus 4.1: 4 episodes × ~8K tokens each
+        single: 8000
     }
 };
 
 // Helper function to get token limits for a specific model
 function getTokenLimits(model) {
-    return TOKEN_LIMITS_BY_MODEL[model] || { series: 7500, single: 7000 };
+    return TOKEN_LIMITS_BY_MODEL[model] || { series: 32000, single: 8000 };
 }
 
 app.post('/generate', async (req, res) => {
@@ -672,21 +672,33 @@ app.get('/download-partial/:jobId', async (req, res) => {
 
 // Helper function to split series content into episodes
 function splitSeriesContent(content, episodes) {
-    // Try to split by episode markers
+    // Try to split by episode markers using a more robust pattern
     const episodeTexts = [];
     const lines = content.split('\n');
     let currentEpisode = [];
-    let episodeCount = 0;
+    let episodeHeadersFound = 0;
 
-    for (const line of lines) {
-        if ((line.toLowerCase().includes('episode') && line.includes(':')) || line.match(/^#+\s+.*Episode\s+\d/i)) {
-            if (currentEpisode.length > 0 && episodeCount > 0) {
+    // Look for markdown headers with "Episode" followed by a number
+    // Pattern: "# Episode 1:", "## Episode 1", etc.
+    // This prevents false matches on casual episode mentions like "end of episode 1"
+    const episodeHeaderPattern = /^#+\s+(?:.*\s)?Episode\s+(\d+)/i;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const match = line.match(episodeHeaderPattern);
+
+        // If we found an episode header
+        if (match) {
+            // Save the previous episode if we have one
+            if (currentEpisode.length > 0 && episodeHeadersFound > 0) {
                 episodeTexts.push(currentEpisode.join('\n'));
                 currentEpisode = [];
             }
-            episodeCount++;
+            episodeHeadersFound++;
+            currentEpisode.push(line);
+        } else {
+            currentEpisode.push(line);
         }
-        currentEpisode.push(line);
     }
 
     // Don't forget the last episode
@@ -696,6 +708,7 @@ function splitSeriesContent(content, episodes) {
 
     // If we couldn't parse episodes properly, split approximately
     if (episodeTexts.length < episodes.length) {
+        console.warn(`Found ${episodeTexts.length} episodes, expected ${episodes.length}. Falling back to line-based split.`);
         const linesPerEpisode = Math.floor(lines.length / episodes.length);
         episodeTexts.length = 0;
 
